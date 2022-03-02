@@ -39,7 +39,6 @@ __pdoc__ = {
     'Trade.__init__': False,
 }
 
-
 class Strategy(metaclass=ABCMeta):
     """
     A trading strategy base class. Extend this class and
@@ -1092,6 +1091,59 @@ class Backtest:
         self._strategy = strategy
         self._results: Optional[pd.Series] = None
 
+    def reset(self, **kwargs):
+        self.sim_data = _Data(self._data.copy(deep=False))
+        self.sim_broker: _Broker = self._broker(data=self.sim_data)
+        self.sim_strategy: Strategy = self._strategy(self.sim_broker, self.sim_data, kwargs)
+
+        self.sim_strategy.init()
+        self.sim_data._update()  # Strategy.init might have changed/added to data.df
+
+        # Indicators used in Strategy.next()
+        self.sim_indicator_attrs = {attr: indicator
+                                    for attr, indicator in self.sim_strategy.__dict__.items()
+                                    if isinstance(indicator, _Indicator)}.items()
+
+        # Skip first few candles where indicators are still "warming up"
+        # +1 to have at least two entries available
+        self.sim_start = 1 + max((np.isnan(indicator.astype(float)).argmin(axis=-1).max()
+                         for _, indicator in self.sim_indicator_attrs), default=0)
+        self.sim_idx = self.sim_start
+        for warmup in range(self.sim_start):
+            self.step()
+
+    def step(self):
+        with np.errstate(invalid='ignore'):
+            self.sim_data._set_length(self.sim_idx + 1)
+            for attr, indicator in self.sim_indicator_attrs:
+                # Slice indicator on the last dimension (case of 2d indicator)
+                setattr(self.sim_strategy, attr, indicator[..., :self.sim_idx + 1])
+
+            # Handle orders processing and broker stuff
+            self.sim_broker.next()
+
+            # Next tick, a moment before bar close
+            self.sim_strategy.next()
+
+            self.sim_idx += 1
+            is_done = self.sim_idx == len(self._data)
+            
+            if is_done:
+                # Set data back to full length
+                # for future `indicator._opts['data'].index` calls to work
+                self.sim_data._set_length(len(self._data))
+
+                equity = pd.Series(self.sim_broker._equity).bfill().fillna(self.sim_broker._cash).values
+                self._results = compute_stats(
+                    trades=self.sim_broker.closed_trades,
+                    equity=equity,
+                    ohlc_data=self._data,
+                    risk_free_rate=0.0,
+                    strategy_instance=self.sim_strategy,
+                )
+
+        return is_done
+
     def run(self, **kwargs) -> pd.Series:
         """
         Run the backtest. Returns `pd.Series` with results and statistics.
@@ -1131,66 +1183,71 @@ class Backtest:
             _trades                       Size  EntryB...
             dtype: object
         """
-        data = _Data(self._data.copy(deep=False))
-        broker: _Broker = self._broker(data=data)
-        strategy: Strategy = self._strategy(broker, data, kwargs)
-
-        strategy.init()
-        data._update()  # Strategy.init might have changed/added to data.df
-
-        # Indicators used in Strategy.next()
-        indicator_attrs = {attr: indicator
-                           for attr, indicator in strategy.__dict__.items()
-                           if isinstance(indicator, _Indicator)}.items()
-
-        # Skip first few candles where indicators are still "warming up"
-        # +1 to have at least two entries available
-        start = 1 + max((np.isnan(indicator.astype(float)).argmin(axis=-1).max()
-                         for _, indicator in indicator_attrs), default=0)
-
-        # Disable "invalid value encountered in ..." warnings. Comparison
-        # np.nan >= 3 is not invalid; it's False.
-        with np.errstate(invalid='ignore'):
-
-            for i in range(start, len(self._data)):
-                # Prepare data and indicators for `next` call
-                data._set_length(i + 1)
-                for attr, indicator in indicator_attrs:
-                    # Slice indicator on the last dimension (case of 2d indicator)
-                    setattr(strategy, attr, indicator[..., :i + 1])
-
-                # Handle orders processing and broker stuff
-                try:
-                    broker.next()
-                except _OutOfMoneyError:
-                    break
-
-                # Next tick, a moment before bar close
-                strategy.next()
-            else:
-                # Close any remaining open trades so they produce some stats
-                for trade in broker.trades:
-                    trade.close()
-
-                # Re-run broker one last time to handle orders placed in the last strategy
-                # iteration. Use the same OHLC values as in the last broker iteration.
-                if start < len(self._data):
-                    try_(broker.next, exception=_OutOfMoneyError)
-
-            # Set data back to full length
-            # for future `indicator._opts['data'].index` calls to work
-            data._set_length(len(self._data))
-
-            equity = pd.Series(broker._equity).bfill().fillna(broker._cash).values
-            self._results = compute_stats(
-                trades=broker.closed_trades,
-                equity=equity,
-                ohlc_data=self._data,
-                risk_free_rate=0.0,
-                strategy_instance=strategy,
-            )
-
+        self.reset(**kwargs)
+        done = self.step()
+        while not done:
+            done = self.step()
         return self._results
+        # data = _Data(self._data.copy(deep=False))
+        # broker: _Broker = self._broker(data=data)
+        # strategy: Strategy = self._strategy(broker, data, kwargs)
+
+        # strategy.init()
+        # data._update()  # Strategy.init might have changed/added to data.df
+
+        # # Indicators used in Strategy.next()
+        # indicator_attrs = {attr: indicator
+        #                    for attr, indicator in strategy.__dict__.items()
+        #                    if isinstance(indicator, _Indicator)}.items()
+
+        # # Skip first few candles where indicators are still "warming up"
+        # # +1 to have at least two entries available
+        # start = 1 + max((np.isnan(indicator.astype(float)).argmin(axis=-1).max()
+        #                  for _, indicator in indicator_attrs), default=0)
+
+        # # Disable "invalid value encountered in ..." warnings. Comparison
+        # # np.nan >= 3 is not invalid; it's False.
+        # with np.errstate(invalid='ignore'):
+
+        #     for i in range(start, len(self._data)):
+        #         # Prepare data and indicators for `next` call
+        #         data._set_length(i + 1)
+        #         for attr, indicator in indicator_attrs:
+        #             # Slice indicator on the last dimension (case of 2d indicator)
+        #             setattr(strategy, attr, indicator[..., :i + 1])
+
+        #         # Handle orders processing and broker stuff
+        #         try:
+        #             broker.next()
+        #         except _OutOfMoneyError:
+        #             break
+
+        #         # Next tick, a moment before bar close
+        #         strategy.next()
+        #     else:
+        #         # Close any remaining open trades so they produce some stats
+        #         for trade in broker.trades:
+        #             trade.close()
+
+        #         # Re-run broker one last time to handle orders placed in the last strategy
+        #         # iteration. Use the same OHLC values as in the last broker iteration.
+        #         if start < len(self._data):
+        #             try_(broker.next, exception=_OutOfMoneyError)
+
+        #     # Set data back to full length
+        #     # for future `indicator._opts['data'].index` calls to work
+        #     data._set_length(len(self._data))
+
+        #     equity = pd.Series(broker._equity).bfill().fillna(broker._cash).values
+        #     self._results = compute_stats(
+        #         trades=broker.closed_trades,
+        #         equity=equity,
+        #         ohlc_data=self._data,
+        #         risk_free_rate=0.0,
+        #         strategy_instance=strategy,
+        #     )
+
+        # return self._results
 
     def optimize(self, *,
                  maximize: Union[str, Callable[[pd.Series], float]] = 'SQN',
